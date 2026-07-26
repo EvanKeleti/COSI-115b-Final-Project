@@ -10,6 +10,7 @@ from tqdm import tqdm
 
 from generate_data import generate_hard_negatives
 from graph_builder import UPOS_MAP, NER_MAP, REL_MAP
+from loss import get_loss_on_batch
 from model import GraphMatcher, ModelConfig
 
 
@@ -27,13 +28,13 @@ def evaluate_model(model, val_loader, num_batches, tqdm_pos: int = 0):
             break
 
         scores = model(batch)
-        total_loss += model.get_loss_on_batch(scores).item()
+        total_loss += get_loss_on_batch(model.temperature, model.device, scores).item()
         accuracy_sum += model.get_accuracy_on_batch(scores)
 
         avg_val_loss = total_loss / b
         accuracy = accuracy_sum / b
 
-        tqdm.write(f"\r{f'Average loss: {avg_val_loss:.4f}':<20} {f'Accuracy: {accuracy:.4f}':<20}")
+        tqdm.write(f"\r{f'Average loss: {avg_val_loss:.4f}':<20} {f'Accuracy: {accuracy:.4f}':<20}", end="")
 
     return avg_val_loss, accuracy
 

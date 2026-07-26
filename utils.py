@@ -13,7 +13,7 @@ def ema(x, alpha=0.95):
         y[i] = alpha * y[i - 1] + (1 - alpha) * x[i]
     return y
 
-
+# TODO title or file name with model type (heads, layers, etc)
 def plot_results(
         losses: list[float],
         grad_norms: list[float],
@@ -21,7 +21,7 @@ def plot_results(
 ) -> None:
     # Replace non-finite grad norms
     # Temp fix until figure out cause of bad gradients and fix root cause
-    grads_copy = grad_norms.copy()
+    grads_copy = grad_norms.copy() # todo - don't do at beginning of norms, just plot starting at first valid
     for i, f in enumerate(torch.isfinite(torch.tensor(grads_copy))):
         if not f:
             if i == 0:
@@ -34,10 +34,12 @@ def plot_results(
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
+    x_values = range(1, len(losses) + 1)
+
     # Left panel - Loss curve
-    ax1.plot(losses, alpha=0.2, label='Raw')
-    ax1.plot(smoothed_loss, alpha=0.95, label='Smoothed')
-    ax1.set_ylim(0, 10) # No need to plot outliers in raw losses - they make important part of graph flattened visually
+    ax1.plot(x_values, losses, alpha=0.2, label='Raw')
+    ax1.plot(x_values, smoothed_loss, alpha=0.95, label='Smoothed')
+    ax1.set_ylim(0, max(smoothed_loss) * 1.5) # No need to plot outliers in raw losses - they make important part of graph flattened visually
     ax1.legend(loc='best')
     ax1.set_title('Training Loss')
     ax1.set_xlabel('Batch')
@@ -45,9 +47,9 @@ def plot_results(
     ax1.grid(True)
 
     # Right panel - Gradient norm
-    ax2.plot(grad_norms, alpha=0.2, label='Raw')
-    ax2.plot(smoothed_grad, alpha=0.95, label='Smoothed')
-    ax2.set_ylim(0, 50)
+    ax2.plot(x_values, grad_norms, alpha=0.2, label='Raw')
+    ax2.plot(x_values, smoothed_grad, alpha=0.95, label='Smoothed')
+    ax2.set_ylim(0, max(smoothed_grad) * 1.5)
     ax2.legend(loc='best')
     ax2.set_title('Gradient Norm')
     ax2.set_xlabel('Batch')

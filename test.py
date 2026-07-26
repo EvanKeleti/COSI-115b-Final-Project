@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader
 from client.providers import Query
 from client.query import query_model_with_backoff
 from graph_builder import NER_MAP, REL_MAP, UPOS_MAP
+from loss import get_loss_on_batch
 from model import GraphMatcher, RGAT, ModelConfig
 
 os.makedirs("test", exist_ok=True)
@@ -84,7 +85,7 @@ def test_graph_matcher():
     with open("test/model_input.pkl", "rb") as f:
         batch = pickle.load(f)
     model = GraphMatcher(config).to(torch.device("cuda"))
-    loss = model.get_loss_on_batch(batch)
+    loss = get_loss_on_batch(model.temperature, model.device, batch)
     print(type(loss))
     print(loss)
 
