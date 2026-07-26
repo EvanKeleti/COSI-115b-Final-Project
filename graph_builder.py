@@ -7,6 +7,9 @@ from stanza import Document
 from torch import Tensor
 from torch.nn.utils.rnn import pad_sequence
 
+langs = ['en', 'zh']
+LANG_MAP = {lang: i for i, lang in enumerate(langs)}
+
 upos_list = [
     "<PAD>", "<UNK>", "ADJ", "ADP", "ADV", "AUX",
     "CCONJ", "DET", "INTJ", "NOUN", "NUM", "PART",
@@ -109,8 +112,15 @@ class Edge:
     relation: int
 
 
+@dataclass
+class Graph:
+    nodes: list[Node]
+    edges: list[Edge]
+    lang: int
+
+
 @torch.no_grad()
-def build_graph(doc: Document, embeddings: Tensor) -> dict[str, list[Node] | list[Edge]]:
+def build_graph(doc: Document, embeddings: Tensor, lang: str) -> Graph:
     nodes, edges = [], []
     # Add nodes and dependency edges for each word
     for i, word in enumerate(doc.iter_words()):
@@ -129,17 +139,17 @@ def build_graph(doc: Document, embeddings: Tensor) -> dict[str, list[Node] | lis
     # Add entity node and span edges for each entity
     for ent in doc.ents:
         node_id = len(nodes) + 1  # Entity node will be added to end of list
-        ent_embeds = torch.zeros(len(ent.words), embeddings.size(-1))
+        emb_idx = []
         for i, word in enumerate(ent.words):
-            ent_embeds[i] = embeddings[word.id - 1]
+            emb_idx.append(word.id - 1)
             edges.append(Edge(
                 head=node_id,
                 target=word.id,
                 relation=REL_MAP["PART_OF_ENTITY"],
             ))
         nodes.append(Node(
-            xlmr=torch.mean(ent_embeds, dim=0),
+            xlmr=torch.mean(embeddings[emb_idx, :], dim=0),
             ner=NER_MAP[ent.type],
             upos=UPOS_MAP["ENTITY"],
         ))
-    return {"nodes": nodes, "edges": edges}
+    return Graph(nodes=nodes, edges=edges, lang=LANG_MAP[lang])
