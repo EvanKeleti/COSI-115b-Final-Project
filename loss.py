@@ -182,18 +182,19 @@ class MoCoInfoNCELoss(nn.Module):
             return loss
 
         losses = []
-        for lang, q_lang in itertools.permutations(batch.keys()):
-            q = self.queues[q_lang]
-            # Concat other language samples from current batch and from queue
-            max_nodes = max(batch[q_lang]["nodes"].size(1), q.queue_nodes.size(1))
-            nodes, node_mask = pad_nodes(batch[q_lang]["nodes"], max_nodes), pad_nodes(batch[q_lang]["node_mask"], max_nodes)
+        for lang, lang_neg in itertools.permutations(batch.keys()):
+            # Concatenate negative language samples from current batch and from queue
+            q = self.queues[lang_neg]
+            max_nodes = max(batch[lang_neg]["nodes"].size(1), q.queue_nodes.size(1))
+            nodes = pad_nodes(batch[lang_neg]["nodes"], max_nodes)
+            node_mask = pad_nodes(batch[lang_neg]["node_mask"], max_nodes)
             q_nodes, q_mask = pad_nodes(q.queue_nodes, max_nodes), pad_nodes(q.queue_mask, max_nodes)
             q_nodes = torch.cat([nodes, q_nodes], dim=0)
             q_mask = torch.cat([node_mask, q_mask], dim=0)
             # Score language against other lang of same batch and queue
             scores = scorer({
                 lang: batch[lang],
-                q_lang: TensorDict({"nodes": q_nodes, "node_mask": q_mask}, batch_size=q_nodes.size(0)),
+                lang_neg: TensorDict({"nodes": q_nodes, "node_mask": q_mask}, batch_size=q_nodes.size(0)),
             })
             labels = torch.arange(scores.size(0), device=scores.device)
             scores = scores / self.temperature

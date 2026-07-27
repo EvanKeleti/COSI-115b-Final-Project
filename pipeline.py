@@ -1,4 +1,5 @@
 import itertools
+import os
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterable
@@ -6,21 +7,19 @@ from typing import Iterable
 import torch
 from accelerate import Accelerator
 from dacite import from_dict
-from datasets import Dataset
 from dotenv import load_dotenv
 from jaxtyping import Float
 from tensordict import TensorDict
 from torch import Tensor
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
-from torch.utils.hipify.hipify_python import preprocessor
 from tqdm import tqdm
 
-from data import load_wmt_data, get_preprocessed_data, preprocess_and_save_chunks
+from data import load_wmt_data
 from graph_builder import UPOS_MAP, NER_MAP, REL_MAP
 from graph_encoder import RGATConfig, RGAT
 from graph_scorer import GraphScorer, ScorerConfig
 from loss import MoCoConfig, MoCoInfoNCELoss
-from preprocess import Preprocessor
+from preprocess import GraphCollator, Featurizer
 from utils import plot_results
 
 
@@ -64,6 +63,7 @@ class Pipeline():
                 tqdm.write(f"Checkpoint found at batch {self.state['next_datapoint'] // self.train_args.batch_size}.")
             first = False
         else:
+            os.makedirs(checkpoint_dir, exist_ok=True)
             self.state = {
                 "next_datapoint": 0,
                 "losses": [],
@@ -155,27 +155,13 @@ class Pipeline():
         if sd := self.state.get("scheduler_state_dict", False):
             self.scheduler.load_state_dict(sd)
 
-    def _init_preprocessor(self, verbose: bool, dataset: Dataset, batch_size: int):
-        preprocessor = Preprocessor(
-            dataset,
-            self.train_args.rgat_config.embedding_model,  # todo change these to be train_args
-            self.train_args.rgat_config.langs,
-            batch_size=batch_size,
-            output_batch_size=batch_size,
-            show_pbar=False,
-            multithread=True,
-            use_gpu=True,
-            verbose=verbose,
-        )
-        return preprocessor
-
     def save_checkpoint(self):
         self.state["rgat_state_dict"] = self.rgat.state_dict()
         self.state["scorer_state_dict"] = self.scorer.state_dict()
         self.state["moco_state_dict"] = self.moco_loss.state_dict()
         self.state["optimizer_state_dict"] = self.optimizer.state_dict()
         self.state["scheduler_state_dict"] = self.scheduler.state_dict()
-        torch.save(self.state, self.checkpoint_file)
+        torch.save(self.state, self.checkpoint_file)  # todo don't double save with torch and accelerate
         self.accelerator.save_state(output_dir=str(self.checkpoint_file.parent / "accelerate"))
 
     # todo do in moco - accuracy against many negatives
@@ -198,17 +184,21 @@ class Pipeline():
     def evaluate(self, batch_size: int, num_batches: int):
         self.rgat.eval()
         self.scorer.eval()
-        validation_data = load_wmt_data('validation').shuffle().select(range(num_batches))
-
+        validation_data = load_wmt_data('validation').shuffle().select(range(num_batches * self.train_args.batch_size))
+        graph_collator = GraphCollator(
+            langs=['zh', 'en'],
+            batch_size=self.train_args.batch_size,
+            dataset=validation_data,
+        )
         try:
-            preprocessor = self._init_preprocessor(verbose=True, dataset=validation_data, batch_size=batch_size)
+            featurizer = Featurizer(graph_collator, self.train_args.batch_size)
 
             accuracy_sum = 0.0
 
             pbar = tqdm(
-                enumerate(preprocessor, 1),
-                total=self.train_args.total_steps,
-                smoothing=0.01,
+                enumerate(featurizer, 1),
+                total=num_batches,
+                smoothing=0.1,
                 desc=f"Evaluating on {num_batches} batches",
                 leave=True,
             )
@@ -236,7 +226,7 @@ class Pipeline():
                 pbar.set_postfix_str(f"Accuracy: {accuracy * 100:.2f}")
 
         finally:
-            preprocessor.terminate_processors()
+            graph_collator.stop_processing()
 
     def train_step(self, batch: dict[str, TensorDict]):
         with self.accelerator.accumulate(self.rgat, self.scorer):
@@ -273,24 +263,15 @@ class Pipeline():
 
             self.state['next_datapoint'] += next(iter(batch.values())).size(0)
 
-        # todo first implement parallelized preproccessing and model
-        # chunks = dataset_chunk_generator(self.train_data, chunk_size=self.train_args * batches_per_chunk)
-    def _training_loop(self, train_data: Iterable[dict[str, TensorDict]], batches_for_checkpoint: int): # todo num_steps arg?
+    def _training_loop(self, train_data: Iterable[dict[str, TensorDict]],
+                       batches_for_checkpoint: int):  # todo num_steps arg?
         self.rgat.train()
         self.scorer.train()
         # self.scorer.sinkhorn.log_reg.requires_grad = False
 
         finished_batches = self.state['next_datapoint'] // self.train_args.batch_size
-        # while finished_batches != self.train_args.total_steps:
-        #
-        #     if len(preprocessed_data) == 0:
-        #         preprocess_and_save_chunks('train', finished_batches, 1, pbar_pos=1)
-        #         preprocessed_data = get_preprocessed_data('train', finished_batches)
 
-            # main_stream = torch.cuda.Stream()
-            # with torch.cuda.stream(main_stream):
-
-        pbar = tqdm( # todo
+        pbar = tqdm(  # todo
             enumerate(train_data, finished_batches + 1),
             total=self.train_args.total_steps,
             initial=finished_batches,
@@ -307,43 +288,42 @@ class Pipeline():
             self.train_step(batch)
 
             if b % batches_for_checkpoint == 0 or b == self.train_args.total_steps:
+                # Save checkpoint
+                self.save_checkpoint()
+                # tqdm.write(
+                #     f"Batch {b}: "
+                #     f"Allocated: {torch.cuda.memory_allocated() // 1024**2}, "
+                #     f"Reserved: {torch.cuda.memory_reserved() // 1024**2}"
+                # )
                 # Plot losses and grad norms
                 plot_results(self.state["losses"], self.state["grad_norms"],
                              save_path=str(self.checkpoint_file.parent / "losses_and_grad_norms.png"))
-                # Save checkpoint
-                self.save_checkpoint()
-                tqdm.write(
-                    f"Batch {b}: "
-                    f"Allocated: {torch.cuda.memory_allocated() / 1024**2}, "
-                    f"Reserved: {torch.cuda.memory_reserved() / 1024**2}"
-                )
 
             finished_batches += 1
 
     def training_loop(self, batches_for_checkpoint: int):
         finished_batches = self.state['next_datapoint'] // self.train_args.batch_size
-        preprocessed_data = get_preprocessed_data('train', finished_batches)
-        if len(preprocessed_data) != 0:
-            self._training_loop(preprocessed_data, batches_for_checkpoint)
-        finished_batches = self.state['next_datapoint'] // self.train_args.batch_size
         if finished_batches == self.train_args.total_steps:
             return
-        train_data = load_wmt_data(
-            'train',
-            range(self.state['next_datapoint'], self.train_args.total_steps * self.train_args.batch_size),
+        graph_collator = GraphCollator(
+            langs=['zh', 'en'],
+            batch_size=self.train_args.batch_size,
+            split='train',
+            selection_range=(self.state['next_datapoint'], self.train_args.total_steps * self.train_args.batch_size),
         )
         try:
-            preprocessor = self._init_preprocessor(True, train_data, self.train_args.batch_size)
-            self._training_loop(preprocessor, batches_for_checkpoint)
+            featurizer = Featurizer(graph_collator, self.train_args.batch_size)
+            self._training_loop(featurizer, batches_for_checkpoint)
         finally:
-            preprocessor.terminate_processors()
+            graph_collator.stop_processing()
+
 
 def main():
     load_dotenv()
     CHECKPOINT_BASE_DIR = Path("model/")
 
     rgat_config = RGATConfig(
-        n_layers=2,
+        n_layers=3,
         n_heads=16,
         d_upos=16,
         num_upos=len(UPOS_MAP),
@@ -365,7 +345,7 @@ def main():
     train_args = TrainArgs(
         peak_lr=1e-4,
         # final_lr=1e-6, # todo
-        total_steps=10000,
+        total_steps=100000,
         batch_size=8,
         rgat_config=rgat_config,
         scorer_config=scorer_config,
@@ -375,8 +355,9 @@ def main():
     )
     pipeline = Pipeline(CHECKPOINT_BASE_DIR / Path(str(rgat_config)), train_args)
 
-    pipeline.training_loop(batches_for_checkpoint=100)
-    # pipeline.evaluate(8, 100)
+    pipeline.training_loop(batches_for_checkpoint=50)
+    pipeline.evaluate(8, 100)
+
 
 if __name__ == '__main__':
     main()
