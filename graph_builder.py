@@ -1,11 +1,7 @@
-from collections import defaultdict
+from dataclasses import dataclass
 
 import torch
-from dataclasses import dataclass, fields
-from jaxtyping import Float, Int
 from stanza import Document
-from torch import Tensor
-from torch.nn.utils.rnn import pad_sequence
 
 langs = ['en', 'zh']
 LANG_MAP = {lang: i for i, lang in enumerate(langs)}
@@ -92,14 +88,14 @@ deprels = [
     "xcomp",  # open clausal complement
 ]
 rel_list = deprels + ["PART_OF_ENTITY"]  # represents graph edge between entity and the words that are part of it
-rel_list += ["obl:tmod"] # Was encountered later in training, needed to add without messing up embeddings
+rel_list += ["obl:tmod"]  # Was encountered later in training, needed to add without messing up embeddings
 REL_MAP = {rel: i for i, rel in enumerate(rel_list, 2)}  # 0 is reserved to indicate no relation
 SELF_REL = 1  # 1 is reserved for self loop for attention masking
 
 
 @dataclass
 class Node:
-    xlmr: Tensor
+    span: tuple[int, int]
     ner: int
     upos: int
     # srl: str # TODO - SRL is next thing to add to graph
@@ -117,39 +113,49 @@ class Graph:
     nodes: list[Node]
     edges: list[Edge]
     lang: int
+    text: str
 
 
 @torch.no_grad()
-def build_graph(doc: Document, embeddings: Tensor, lang: str) -> Graph:
+def build_graph(doc: Document, lang: str) -> Graph:
+    assert len(doc.sentences) == 1
+    sent = doc.sentences[0]
     nodes, edges = [], []
     # Add nodes and dependency edges for each word
-    for i, word in enumerate(doc.iter_words()):
-        ner = word.parent.ner  # TODO - consider adding bios entity features
-        base_tag = ner if ner == 'O' else ner[2:]
-        nodes.append(Node(
-            xlmr=embeddings[i],
-            ner=NER_MAP[base_tag],
-            upos=UPOS_MAP[word.upos],
-        ))
-        edges.append(Edge(
-            head=word.head,  # 1 based indexing - 0 represents root, which has learned node embedding in model
-            target=word.id,
-            relation=REL_MAP[word.deprel],
-        ))
-    # Add entity node and span edges for each entity
-    for ent in doc.ents:
-        node_id = len(nodes) + 1  # Entity node will be added to end of list
-        emb_idx = []
-        for i, word in enumerate(ent.words):
-            emb_idx.append(word.id - 1)
-            edges.append(Edge(
-                head=node_id,
-                target=word.id,
-                relation=REL_MAP["PART_OF_ENTITY"],
+    # NOTE: This logic only works for languages where MWTs map directly back to source text
+    for token in sent.tokens:
+        word_start = token.start_char
+        for word in token.words:
+            ner = word.parent.ner  # TODO - consider adding bios entity features
+            base_tag = ner if ner == 'O' else ner[2:]
+            nodes.append(Node(
+                span=(word_start, word_start + len(word.text)),
+                ner=NER_MAP[base_tag],
+                upos=UPOS_MAP[word.upos],
             ))
+            edges.append(Edge(
+                head=word.head,  # 1 based indexing - 0 represents root, which has learned node embedding in model
+                target=word.id,
+                relation=REL_MAP[word.deprel],
+            ))
+            word_start += len(word.text)
+    # Add entity node and span edges for each entity
+    for ent in sent.ents:
+        node_id = len(nodes) + 1  # Entity node will be added to end of list
+        word_indices = []
+        for token in ent.tokens:
+            word_start = token.start_char
+            for word in token.words:
+                word_indices.append(word.id)
+                edges.append(Edge(
+                    head=node_id,
+                    target=word.id,
+                    relation=REL_MAP["PART_OF_ENTITY"],
+                ))
+                word_start += len(word.text)
         nodes.append(Node(
-            xlmr=torch.mean(embeddings[emb_idx, :], dim=0),
+            span=(ent.start_char, ent.end_char),
             ner=NER_MAP[ent.type],
             upos=UPOS_MAP["ENTITY"],
         ))
-    return Graph(nodes=nodes, edges=edges, lang=LANG_MAP[lang])
+    return Graph(nodes=nodes, edges=edges, lang=LANG_MAP[lang], text=sent.text)
