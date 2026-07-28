@@ -10,7 +10,7 @@ from datasets import Dataset
 from dotenv import load_dotenv
 from torch import Tensor
 
-CACHE_DIR = Path("cache/")
+CACHE_DIR = Path(__file__).parent / Path("cache/")
 
 
 def load_wmt_data(split: str, indices: Iterable[int] = None):

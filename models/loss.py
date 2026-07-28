@@ -4,13 +4,13 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
-from jaxtyping import Float
 from tensordict import TensorDict
 from torch import nn, Tensor
 from tqdm import tqdm
 
-from graph_encoder import RGAT, RGATConfig
-from graph_scorer import GraphScorer
+from .graph_encoder import RGAT
+from .graph_scorer import GraphScorer
+
 
 # gpt function
 def pad_nodes(x, target_nodes, value=0.0):
@@ -75,11 +75,14 @@ class MoCoConfig:
     use_momentum_encoder: bool
     langs: list[str]
     K: int
-    init_tau: float = 0.07
+    momentum: float
+    init_tau: float
     max_nodes: int = 64
     d_node: int = 768
     online_encoder: Optional[RGAT] = None
-    momentum: float = 0.99
+
+    def __str__(self):
+        return f"{self.K}_queue"
 
 
 class MoCoQueue(nn.Module):
@@ -89,9 +92,11 @@ class MoCoQueue(nn.Module):
 
         self.max_nodes = config.max_nodes
 
+        random_queue = torch.randn(config.K, config.max_nodes, config.d_node)
+        normalized_queue = F.normalize(random_queue, p=2, dim=2)
         self.register_buffer(
             "queue_nodes",
-            torch.zeros(config.K, config.max_nodes, config.d_node)
+            normalized_queue,
         )
 
         self.register_buffer(
@@ -140,9 +145,10 @@ class MomentumEncoder(nn.Module):
         super().__init__()
 
         self.momentum_encoder = RGAT(config.online_encoder.config)
-        self.momentum_encoder.load_state_dict(config.online_encoder.state_dict()) # todo way to save momentum encoder
-        for p in self.momentum_encoder.parameters():
-            p.requires_grad = False
+        self.momentum_encoder.load_state_dict(config.online_encoder.state_dict())  # todo way to save momentum encoder
+        for param_q, param_k in zip(self.momentum_encoder.parameters(), config.online_encoder.parameters()):
+            param_k.data.copy_(param_q.data)  # Initialize k with q
+            param_k.requires_grad = False
 
         self.register_buffer("momentum", torch.tensor(config.momentum))
 
@@ -163,57 +169,79 @@ class MoCoInfoNCELoss(nn.Module):
         assert len(config.langs) == 2
 
         self.K = config.K
+        self.max_nodes = config.max_nodes
 
         self.register_buffer("temperature", torch.tensor(config.init_tau))
         if config.K != 0:
             self.queues = nn.ModuleDict({lang: MoCoQueue(config) for lang in config.langs})
-        # Can use momentum encoder OR online encoder
-        self.momentum_encoder = MomentumEncoder(config) if config.use_momentum_encoder else None
+            self.momentum_encoder = MomentumEncoder(config) if config.use_momentum_encoder else None
 
-    def forward(self, batch: dict[str, TensorDict], scorer: GraphScorer, online_encoder: RGAT = None):
-        if self.K == 0:
-            scores = scorer(batch)
+    def forward(
+            self,
+            inputs: dict[str, TensorDict],
+            outputs: dict[str, TensorDict],
+            scorer: GraphScorer,
+            online_encoder: RGAT = None
+    ):
+        max_nodes = max(output["nodes"].size(1) for output in outputs.values())
+        if self.K == 0 or max_nodes > 2 * self.max_nodes: # todo
+            if self.K != 0:
+                tqdm.write(f"max_nodes is {max_nodes}, not using queue")
+            scores = scorer(outputs)
             scores = scores / self.temperature
 
             labels = torch.arange(scores.size(0), device=scores.device)
             loss_1 = F.cross_entropy(scores, labels)
             loss_2 = F.cross_entropy(scores.T, labels)
             loss = (loss_1 + loss_2) / 2
-            return loss
+            with torch.no_grad():
+                accuracy_1 = (torch.argmax(scores, dim=-1) == labels).sum() / scores.size(0)
+                accuracy_2 = (torch.argmax(scores.T, dim=-1) == labels).sum() / scores.size(0)
+                accuracy = (accuracy_1 + accuracy_2) / 2
+            return loss, accuracy.item() * 100 # todo this loss and accuracy are misleading, since the queue isn't being used
 
         losses = []
-        for lang, lang_neg in itertools.permutations(batch.keys()):
+        accuracies = []
+        for l_query, l_key in itertools.permutations(outputs.keys()):
             # Concatenate negative language samples from current batch and from queue
-            q = self.queues[lang_neg]
-            max_nodes = max(batch[lang_neg]["nodes"].size(1), q.queue_nodes.size(1))
-            nodes = pad_nodes(batch[lang_neg]["nodes"], max_nodes)
-            node_mask = pad_nodes(batch[lang_neg]["node_mask"], max_nodes)
-            q_nodes, q_mask = pad_nodes(q.queue_nodes, max_nodes), pad_nodes(q.queue_mask, max_nodes)
-            q_nodes = torch.cat([nodes, q_nodes], dim=0)
-            q_mask = torch.cat([node_mask, q_mask], dim=0)
-            # Score language against other lang of same batch and queue
+            queue = self.queues[l_key]
+            max_nodes = max(outputs[l_key]["nodes"].size(1), queue.queue_nodes.size(1))
+            keys = pad_nodes(outputs[l_key]["nodes"], max_nodes)
+            key_mask = pad_nodes(outputs[l_key]["node_mask"], max_nodes)
+            queue_keys, queue_key_mask = pad_nodes(queue.queue_nodes, max_nodes), pad_nodes(queue.queue_mask, max_nodes)
+            keys = torch.cat([keys, queue_keys], dim=0)
+            key_mask = torch.cat([key_mask, queue_key_mask], dim=0)
+            # Score query language against other lang of same batch and queue
             scores = scorer({
-                lang: batch[lang],
-                lang_neg: TensorDict({"nodes": q_nodes, "node_mask": q_mask}, batch_size=q_nodes.size(0)),
+                l_query: outputs[l_query],
+                l_key: TensorDict({"nodes": keys, "node_mask": key_mask}, batch_size=keys.size(0)),
             })
+            # print("SCORES: ", scores)
+            # if torch.isnan(outputs[l_query]["nodes"]).any().item():
+            #     tqdm.write(f"Q contains NaN.")
+            # if torch.isnan(keys).any().item():
+            #     tqdm.write(f"K contains NaN.")
+            # if torch.isnan(queue.queue_nodes).any().item():
+            #     tqdm.write("Queue contains NaN.")
+
             labels = torch.arange(scores.size(0), device=scores.device)
+            accuracy = (torch.argmax(scores, dim=-1) == labels).sum() / scores.size(0)
+            accuracies.append(accuracy.detach().item())
             scores = scores / self.temperature
-            # probs = F.softmax(scores, dim=1)
             # tqdm.write("CE: " + str(F.cross_entropy(scores, labels).item()))
             # tqdm.write("Mean positive probability: " + str(probs[torch.arange(scores.size(0)), labels].mean().item()))
             losses.append(F.cross_entropy(scores, labels))
 
         # Add encodings to queue, using momentum encoder if one was given
-        for lang, nodes in batch.items():
-            if self.momentum_encoder:
-                nodes = self.momentum_encoder(nodes)
-            self.queues[lang](nodes["nodes"], nodes["node_mask"])
-        if self.momentum_encoder:
+        for lang in inputs.keys():
+            if self.momentum_encoder is not None:
+                graphs = self.momentum_encoder(inputs[lang])
+            else:
+                graphs = outputs[lang]
+            self.queues[lang](graphs["nodes"], graphs["node_mask"])
+        if self.momentum_encoder is not None:
             if not online_encoder:
                 raise ValueError("If momentum encoder is being used, online_encoder must not be None")
             self.momentum_encoder.momentum_update(online_encoder)
 
-        return torch.stack(losses).mean()
-
-
-
+        return torch.stack(losses).mean(), torch.tensor(accuracies).mean().item() * 100

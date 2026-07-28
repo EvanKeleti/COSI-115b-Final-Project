@@ -42,34 +42,49 @@ class UnbalancedSinkhorn(nn.Module):
           a: (Batch, Max_N) Marginal source weights (padded areas set to 0)
           b: (Batch, Max_M) Marginal target weights (padded areas set to 0)
         """
-        batch_size, max_n, max_m = C.shape
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            C = C.float()
+            a = a.float()
+            b = b.float()
 
-        reg = self.log_reg.exp().clamp(1e-3, 1.0)
+            batch_size, max_n, max_m = C.shape
+            # print(
+            #     "COST: ",
+            #     C.min().item(),
+            #     C.max().item(),
+            #     C.mean().item(),
+            # )
+            reg = self.log_reg.exp().clamp(1e-3, 1.0)
 
-        # 1. Compute the Gibbs Kernel
-        K = torch.exp(-C / reg)  # Shape: (Batch, Max_N, Max_M)
+            # 1. Compute the Gibbs Kernel
+            K = torch.exp(-C / reg)  # Shape: (Batch, Max_N, Max_M)
 
-        # 2. Initialize dual scaling vectors
-        u = torch.ones(batch_size, max_n, device=C.device, dtype=C.dtype)
-        v = torch.ones(batch_size, max_m, device=C.device, dtype=C.dtype)
+            # 2. Initialize dual scaling vectors
+            u = torch.ones(batch_size, max_n, device=C.device, dtype=torch.float32)
+            v = torch.ones(batch_size, max_m, device=C.device, dtype=torch.float32)
 
-        # Exponent modifier for unbalanced KL-divergence penalty
-        fi = self.reg_m / (self.reg_m + reg) if self.reg_m != float("inf") else 1
+            # Exponent modifier for unbalanced KL-divergence penalty
+            fi = self.reg_m / (self.reg_m + reg) if self.reg_m != float("inf") else 1
 
-        # 3. Fixed-iteration loop (ensures uniform parallel GPU execution)
-        for _ in range(self.max_iter):
-            # Update u: a / (K @ v)
-            kv = torch.bmm(K, v.unsqueeze(-1)).squeeze(-1)
-            # Avoid division by zero in padded zones using torch.clamp
-            u = torch.pow((a + 1e-20) / torch.clamp(kv, min=1e-12), fi)
+            # 3. Fixed-iteration loop (ensures uniform parallel GPU execution)
+            for i in range(self.max_iter):
+                # Update u: a / (K @ v)
+                kv = torch.bmm(K, v.unsqueeze(-1)).squeeze(-1)
+                # print(f"kv: min: {kv.min().item()}, max: {kv.max().item()}")
+                # Avoid division by zero in padded zones using torch.clamp
+                # torch.exp(fi * torch.log(torch.clamp(a / torch.clamp(kv, min=1e-12), min=1e-20)))
+                u = torch.pow((a + 1e-20) / torch.clamp(kv, min=1e-12), fi)
+                # print(f"u: min: {u.min().item()}, max: {u.max().item()}")
 
-            # Update v: b / (K.T @ u)
-            ktu = torch.bmm(K.transpose(1, 2), u.unsqueeze(-1)).squeeze(-1)
-            v = torch.pow((b + 1e-20) / torch.clamp(ktu, min=1e-12), fi)
+                # Update v: b / (K.T @ u)
+                ktu = torch.bmm(K.transpose(1, 2), u.unsqueeze(-1)).squeeze(-1)
+                # print(f"ktu: min: {ktu.min().item()}, max: {ktu.max().item()}")
+                v = torch.pow((b + 1e-20) / torch.clamp(ktu, min=1e-12), fi)
+                # print(f"v: min: {v.min().item()}, max: {v.max().item()}")
 
-        # 4. Reconstruct the full transport plan matrices natively
-        # P = diag(u) @ K @ diag(v) -> u[:, :, None] * K * v[:, None, :]
-        plans = u.unsqueeze(-1) * K * v.unsqueeze(1)
+            # 4. Reconstruct the full transport plan matrices natively
+            # P = diag(u) @ K @ diag(v) -> u[:, :, None] * K * v[:, None, :]
+            plans = u.unsqueeze(-1) * K * v.unsqueeze(1)
 
         return plans  # Shape: (Batch, Max_N, Max_M)
 
@@ -102,6 +117,21 @@ class GraphScorer(nn.Module):
         self.num_features = config.num_features
         self.mlp_scorer = MLPScorer(config)
         self.sinkhorn = UnbalancedSinkhorn(config)
+
+        self._init_weights()
+
+    # TODO verify want to init this way
+    def _init_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    torch.nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            elif isinstance(module, nn.LayerNorm):
+                torch.nn.init.zeros_(module.bias)
+                torch.nn.init.ones_(module.weight)
 
     def forward(self, graphs: dict[str, TensorDict]) -> Float[Tensor, "batch batch"]:
         # Get pairwise similarity scores
@@ -140,7 +170,6 @@ class GraphScorer(nn.Module):
         cost = cost / 2.0
         # Get TODO - I should understand more of the math behind this
         P = self.sinkhorn(cost, a_padded, b_padded)
-
         # Use similarity and transport plan matrices to get features
         # Note: 'a' is rows and 'b' is columns
         weighted_sim = P * S
@@ -179,6 +208,8 @@ class GraphScorer(nn.Module):
             # mean_sim,
         ], dim=1)
         assert features.size(1) == self.num_features
+        if torch.isnan(features).any().item():
+            print("FEATURES: ", features)
 
         scores = self.mlp_scorer(features)
         # CHANGE to just trying this

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import itertools
+import json
+import math
 import multiprocessing
+import torch.multiprocessing as mp
 import os
 import queue
 import shutil
@@ -25,13 +28,13 @@ from torch import Tensor
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModel, PreTrainedModel, TokenizersBackend
+from transformers.utils import logging as hf_logging
 from typing_extensions import override
 
-from data import load_wmt_data, CACHE_DIR
-from graph_builder import Graph, build_graph, SELF_REL, Node
+from data_processing.data import load_wmt_data, CACHE_DIR
+from data_processing.graph_builder import Graph, build_graph, SELF_REL, Node
 
-
-# todo decrease script startup time
+SKIP = "[SKIP BATCH]"
 
 
 class StopExecution(Exception):
@@ -245,6 +248,8 @@ class SentencesToGraphs:
         self.out_queue = out_queue
         self.stop_event = stop_event
 
+        out_queue.cancel_join_thread()
+
     def __call__(self):
         sp_to_gb = {self.lang: queue.Queue()}
         self.nlp = StanzaPipeline(
@@ -288,60 +293,64 @@ class GraphCollator:
         self.save = False if dataset else save_graphs
         self.save_interval = save_interval
 
+        self.langs = langs
+        self.batch_size = batch_size
+        self.stop_event = mp.Event()
+
+        self.data_queues = {lang: mp.Queue(maxsize=20) for lang in langs}
+        self.graph_out_queues = {lang: mp.Queue() for lang in langs}
+
+        self.data_splitter = self.sents_to_graphs = None
+
         self.finished_data = None
         self.selected_finished = None
         self.data_dir = CACHE_DIR / split
-        if not dataset:  # todo make not need to save from beginning
+        self.dataset = dataset
+        if not self.dataset:  # todo make not need to save from beginning
             if self.data_dir.exists():
                 self.finished_data = datasets.load_from_disk(self.data_dir)
-                tqdm.write(f"Found {len(self.finished_data)} preprocessed graph pairs.")
-                if selection_range[0] < len(self.finished_data):
-                    end = min(len(self.finished_data), selection_range[1])
+                total = len(self.finished_data)
+                tqdm.write(f"Found {total} preprocessed graph pairs ({total // 8} batches).") # todo batch size should match out batch size of featurizer
+                if selection_range[0] < total:
+                    end = min(total, selection_range[1])
                     self.selected_finished = self.finished_data.select(range(selection_range[0], end))
                     selection_range = (end, selection_range[1])
                     self.save = True
                 else:
-                    self.save = True if selection_range[0] == len(self.finished_data) else save_graphs  # can't save without breaking order
+                    self.save = True if selection_range[0] == len(
+                        self.finished_data) else save_graphs  # can't save without breaking order
 
             if selection_range[0] < selection_range[1]:
-                dataset = load_wmt_data(split, range(selection_range[0], selection_range[1]))
-
-        self.langs = langs
-        self.batch_size = batch_size
-        self.stop_event = multiprocessing.Event()
-
-        self.data_queues = {lang: multiprocessing.Queue(maxsize=20) for lang in langs}
-        self.graph_out_queues = {lang: multiprocessing.Queue() for lang in langs}
-
-        if dataset is not None:
-            self.data_splitter = DataSplitter(
-                dataset=dataset,
-                out_queues=self.data_queues,
-                stop_event=self.stop_event,
-                langs=langs,
-                batch_size=batch_size,
-            )
-            self.sents_to_graphs = {
-                lang: SentencesToGraphs(
-                    lang=lang,
-                    in_queue=self.data_queues[lang],
-                    out_queue=self.graph_out_queues[lang],
-                    stop_event=self.stop_event,
-                )
-                for lang in langs
-            }
-        else:
-            self.data_splitter = self.sents_to_graphs = None
+                self.dataset = load_wmt_data(split, range(selection_range[0], selection_range[1]))
+            else:
+                pass # idk what I meant to put here
 
         self.active = False
 
+
     def start_processing(self) -> None:
-        if self.data_splitter is None or self.active:
+        if self.dataset is None or self.active:
             return
 
+        self.data_splitter = DataSplitter(
+            dataset=self.dataset,
+            out_queues=self.data_queues,
+            stop_event=self.stop_event,
+            langs=self.langs,
+            batch_size=batch_size,
+        )
+        self.sents_to_graphs = {
+            lang: SentencesToGraphs(
+                lang=lang,
+                in_queue=self.data_queues[lang],
+                out_queue=self.graph_out_queues[lang],
+                stop_event=self.stop_event,
+            )
+            for lang in self.langs
+        }
         self.data_splitter.start_processor()
-        tqdm.write("Spawning stanza pipelines...", end="")
-        ctx = multiprocessing.get_context(method='spawn')
+        tqdm.write("Spawning stanza pipelines...")
+        ctx = mp.get_context(method='spawn')
         for std in self.sents_to_graphs.values():
             p = ctx.Process(target=std)
             p.start()
@@ -367,8 +376,8 @@ class GraphCollator:
         self.save_finished(reload=False)
         for q in self.data_queues.values():
             q.cancel_join_thread()
-        for q in self.graph_out_queues.values():
-            q.cancel_join_thread()
+        # for q in self.graph_out_queues.values():
+        #     q.cancel_join_thread()
         self.active = False
 
     def __iter__(self):
@@ -383,7 +392,7 @@ class GraphCollator:
                         for lang in graph_dict.keys()
                     }
                     yield graph_dict
-                    idx += self.batch_size
+                    idx += self.batch_size # todo what if last batch is too small
 
             if not self.active:
                 self.start_processing()
@@ -394,7 +403,7 @@ class GraphCollator:
                     while not self.stop_event.is_set():
                         try:
                             out = q.get(timeout=0.1)
-                            if batch == 0:
+                            if batch == 1:
                                 tqdm.write("Done")
                             if out is None:
                                 raise StopIteration
@@ -417,7 +426,7 @@ class GraphCollator:
                 raise e
 
 
-class Featurizer:
+class Featurizer: # todo make into Processor?
 
     def __init__(
             self,
@@ -425,18 +434,19 @@ class Featurizer:
             graph_collator: GraphCollator,
             out_batch_size: int,
     ):
-        self.graphs_iter = iter(graph_collator)
+        self.graph_collator = graph_collator
         self.out_batch_size = out_batch_size  # todo
 
         self.model_name = "xlm-roberta-base"
-        self.emb_tokenizer: TokenizersBackend = AutoTokenizer.from_pretrained(self.model_name)
-        self.emb_model: PreTrainedModel = AutoModel.from_pretrained(self.model_name, device_map="auto")
-        self.device = next(self.emb_model.parameters()).device
+        self.emb_tokenizer = None
+        self.emb_model = None
+        self.device = None
 
     def __iter__(self):
         try:
-            while True:  # todo
-                graphs_dict = next(self.graphs_iter)
+            graphs_iter = iter(self.graph_collator)
+            while self._can_continue():
+                graphs_dict = next(graphs_iter)
                 langs = []
                 splits = []
                 for lang, graphs in graphs_dict.items():
@@ -444,33 +454,117 @@ class Featurizer:
                     splits.append(len(graphs))
                 langs = graphs_dict.keys()
                 graphs = list(itertools.chain(*graphs_dict.values()))
-                td = self.graphs_to_tensordict(graphs)
-                tds = td.split(split_size=list(splits), dim=0)
-                td_dict = {lang: td for lang, td in zip(langs, tds)}
-                yield td_dict
+                tds = self.graphs_to_tensordict(graphs)
+                if tds == SKIP:
+                    for _ in range(math.ceil(splits[0] / self.out_batch_size)):
+                        yield SKIP
+                    continue
+                tds = tds.cpu().pin_memory().split(split_size=list(splits), dim=0)
+                split_td_dict = {lang: td.split(split_size=self.out_batch_size, dim=0) for lang, td in zip(langs, tds)}
+                num_out = len(next(iter(split_td_dict.values())))
+                out_td_dicts = [{lang: val[i] for lang, val in split_td_dict.items()} for i in range(num_out)]
+                for td_dict in out_td_dicts:
+                    yield td_dict
         except StopIteration:
             pass
+
+    def _can_continue(self) -> bool:
+        if self.graph_collator.stop_event.is_set():
+            raise StopExecution
+        return True
+
+    def __call__(self, out_queue: multiprocessing.Queue):
+        try:
+            hf_logging.set_verbosity_error()
+            hf_logging.disable_progress_bar()
+            self.emb_tokenizer: TokenizersBackend = AutoTokenizer.from_pretrained(
+                self.model_name,
+                force_download=False
+            )
+            self.emb_model: PreTrainedModel = AutoModel.from_pretrained(
+                self.model_name,
+                device_map="auto",
+            )
+            self.device = next(self.emb_model.parameters()).device
+            try:
+                td_dicts = iter(self)
+                while self._can_continue():
+                    td_dict = next(td_dicts)
+                    while self._can_continue():
+                        try:
+                            out_queue.put(td_dict, timeout=0.1)
+                            break
+                        except queue.Full:
+                            time.sleep(0.01)
+            except StopExecution:
+                pass
+            except StopIteration:
+                while self._can_continue():
+                    try:
+                        out_queue.put(None, timeout=0.1)
+                        break
+                    except queue.Full:
+                        time.sleep(0.01)
+            finally:
+                out_queue.close()
+                out_queue.cancel_join_thread()
+        except Exception as e:
+            with open("worker_crash_log.txt", "a") as f:
+                f.write(f"Crash error: {str(e)}\n")
+            raise e
 
     @torch.no_grad()
     def get_aligned_embeddings(self, graphs: list[Graph]) -> Float[Tensor, "batch max_nodes hidden"]:
         sentences = [g.text for g in graphs]
+        batch_size = len(graphs)
 
         # Tokenize for XLM-R
         xlmr_inputs = self.emb_tokenizer(
             sentences,
             padding=True,
+            max_length=512,
+            truncation=True,
+            stride=128,
+            return_overflowing_tokens=True,
             return_tensors="pt",
             return_offsets_mapping=True,
             return_special_tokens_mask=True,
         ).to(device=self.device, non_blocking=True)
         xlmr_offsets = xlmr_inputs.pop("offset_mapping")
         xlmr_special_tokens_mask = xlmr_inputs.pop("special_tokens_mask")
+        sample_mapping = xlmr_inputs.pop("overflow_to_sample_mapping", None)  # Tells us which text index a chunk came from
 
         # Get XLM-R embeddings
         xlmr_outputs = self.emb_model(**xlmr_inputs)
         xlmr_hidden: Float[Tensor, "batch max_xlmr_len hidden"] = xlmr_outputs.last_hidden_state
 
-        batch_size = len(graphs)
+        attention_mask = xlmr_inputs.pop("attention_mask")
+
+        # todo - Verify this works correctly
+        # Concatenate back into one row per sentence, if overflowed past 512 tokens
+        if xlmr_hidden.size(0) > batch_size:
+            hidden_tensors = []
+            mask_tensors = []
+            offsets_tensors = []
+            attention_tensors = []
+            prev_sample_idx = None
+            for chunk_idx, sample_idx in enumerate(sample_mapping.tolist()):
+                if sample_idx == prev_sample_idx:
+                    hidden_tensors[-1] = torch.cat([hidden_tensors[-1], xlmr_hidden[chunk_idx]], dim=0)
+                    mask_tensors[-1] = torch.cat([mask_tensors[-1], xlmr_special_tokens_mask[chunk_idx]], dim=0)
+                    offsets_tensors[-1] = torch.cat([offsets_tensors[-1], xlmr_offsets[chunk_idx]], dim=0)
+                    attention_tensors[-1] = torch.cat([attention_tensors[-1], attention_mask[chunk_idx]], dim=0)
+                else:
+                    hidden_tensors.append(xlmr_hidden[chunk_idx])
+                    mask_tensors.append(xlmr_special_tokens_mask[chunk_idx])
+                    offsets_tensors.append(xlmr_offsets[chunk_idx])
+                    attention_tensors.append(attention_mask[chunk_idx])
+                prev_sample_idx = sample_idx
+            assert len(hidden_tensors) == len(mask_tensors) == len(offsets_tensors) == batch_size
+            xlmr_hidden = torch.nn.utils.rnn.pad_sequence(hidden_tensors, batch_first=True)
+            xlmr_special_tokens_mask = torch.nn.utils.rnn.pad_sequence(mask_tensors, batch_first=True, padding_value=1)
+            xlmr_offsets = torch.nn.utils.rnn.pad_sequence(offsets_tensors, batch_first=True)
+            attention_mask = torch.nn.utils.rnn.pad_sequence(attention_tensors, batch_first=True)
 
         # 1. Extract XLM-R offsets (already on GPU)
         # offsets shape: [B, MaxXlmrTokens, 2]
@@ -503,7 +597,7 @@ class Featurizer:
         has_overlap = overlap_starts < overlap_ends  # Shape: [B, MaxNodes, MaxXlmrTokens]
 
         # 5. Apply the special token / valid word masks
-        token_mask = (xlmr_special_tokens_mask == 0) & (xlmr_inputs["attention_mask"] == 1)
+        token_mask = (xlmr_special_tokens_mask == 0) & (attention_mask == 1)
         token_mask = token_mask.unsqueeze(1)  # Shape: [B, 1, MaxXlmrTokens]
 
         # Create alignment matrix for mean pooling of embeddings of each word's sub-words
@@ -524,6 +618,10 @@ class Featurizer:
     def graphs_to_tensordict(self, graphs: list[Graph]) -> TensorDict:
         max_nodes = max(len(graph.nodes) for graph in graphs)
         batch_size = len(graphs)
+
+        emb = self.get_aligned_embeddings(graphs)
+        if emb == SKIP:
+            return SKIP
 
         keys = [field.name for field in fields(Node)]
 
@@ -570,20 +668,65 @@ class Featurizer:
             # reverse edge: 2 -> 3, 3 -> 5, 4 -> 7
             graphs_td["relations"][b_idx, targets, heads] = (relations * 2) - 1
 
-        graphs_td['xlmr'] = self.get_aligned_embeddings(graphs)
+        graphs_td['xlmr'] = emb
 
         return graphs_td
+
+
+class Preprocessor:
+
+    def __init__(
+            self,
+            graph_collator: GraphCollator,
+            preprocess_batch_size: int,
+            out_batch_size: int,
+    ):
+        self.graph_collator = graph_collator
+        self.featurizer = Featurizer(graph_collator, out_batch_size)
+        self.features_queue = mp.Queue(maxsize=10)
+        self.active = False
+
+    def __iter__(self):
+        if not self.active:
+            self.start_processing()
+        while True:
+            try:
+                batch = self.features_queue.get(timeout=0.1)
+                if batch is None:
+                    break
+                yield batch
+            except queue.Empty:
+                time.sleep(0.01)
+        self.stop_processing() # todo
+
+    def start_processing(self):
+        ctx = mp.get_context('spawn')
+        p = ctx.Process(target=self.featurizer, args=(self.features_queue,))
+        p.start()
+        self.active = True
+
+    def stop_processing(self):
+        self.graph_collator.stop_processing()
 
 
 if __name__ == '__main__':
     load_dotenv()
     os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
-    num_sentences = 10000 * 8
+    num_sentences = 10000 * 8 * 10
     batch_size = 32
     num_batches = num_sentences / batch_size
 
     finished_data = datasets.load_from_disk(CACHE_DIR / 'train')
+    wtf = 30526 * 8
+    test = finished_data[wtf:wtf + 16]
+    test = {lang: [g["text"] for g in test[lang]] for lang in test.keys()}
+    with open('wtf.json', 'w') as f:
+        json.dump(test, f, indent=2)
+    test = finished_data[-16:]
+    test = {lang: [g["text"] for g in test[lang]] for lang in test.keys()}
+    with open('wtf2.json', 'w') as f:
+        json.dump(test, f, indent=2)
     start = len(finished_data)
     del finished_data
 
@@ -593,12 +736,13 @@ if __name__ == '__main__':
         langs=['zh', 'en'],
         batch_size=batch_size,
         split='train',
+        # selection_range=(0, 3981),
         selection_range=(start, num_sentences),
         save_graphs=True,
     )
     # featurizer = Featurizer(graph_collator, 8)
     try:
-        pbar = tqdm(initial=start, total=num_sentences, desc=f"Building {num_sentences} graph_pairs")
+        pbar = tqdm(initial=start, total=num_sentences, desc=f"Building {num_sentences} graph pairs")
         with pbar:
             for batch in graph_collator:
                 pbar.update(len(batch['en']))

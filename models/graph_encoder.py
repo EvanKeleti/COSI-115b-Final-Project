@@ -163,20 +163,13 @@ class RGAT(nn.Module):
                 torch.nn.init.ones_(module.weight)
 
     def forward(self, batch: TensorDict) -> TensorDict | dict: # todo
-        # TODO move send to device out of model code
-        # Send all input tensors to device
-        # self.device = next(self.parameters()).device
-        # for key, tensor in batch.items():
-        #     if self.device.type != tensor.device.type:
-        #         batch[key] = tensor.to(self.device)
-
         # Get embeddings for features and concatenate them
         struct = torch.cat([
             self.upos_embeddings(batch['upos']),
             self.ner_embeddings(batch['ner']),
             self.language_embeddings(batch['lang'].unsqueeze(-1).expand(-1, batch['upos'].size(1)))
         ], dim=-1)
-        # Project into d_model
+        # Project features into d_model and add to xlmr embedding
         struct = self.struct_ln(self.struct_proj(struct))
         x = batch['xlmr'] + struct
         # todo - norm?

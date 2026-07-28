@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from client.providers import Query
 from client.query import get_responses_from_models, ERROR_RESPONSE
 
-RESPONSES_DIR = Path("responses")
+RESPONSES_DIR = Path("../responses")
 DATA_DIR = Path("data")
 
 INVALID_ANS = "[invalid]"

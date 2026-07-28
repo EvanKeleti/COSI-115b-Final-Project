@@ -1,4 +1,4 @@
 .env
 *.idea
-model/*
-cache/*
+checkpoints/
+data_processing/cache/
