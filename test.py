@@ -12,8 +12,8 @@ from torch.utils.data import DataLoader
 
 from client.providers import Query
 from client.query import query_model_with_backoff
-from graph_builder import NER_MAP, REL_MAP, UPOS_MAP
-from loss import get_loss_on_batch
+from data_processing.graph_builder import NER_MAP, REL_MAP, UPOS_MAP
+from models.loss import get_loss_on_batch
 from model import GraphMatcher, RGAT, ModelConfig
 
 os.makedirs("test", exist_ok=True)
@@ -34,7 +34,7 @@ config = ModelConfig(
 
 
 def test_preprocess():
-    from preprocess import get_features
+    from data_processing.preprocess import get_features
     datasets.enable_progress_bars()
     dataset = datasets.load_dataset("wmt/wmt19", "zh-en", streaming=False)
     data = get_features(dataset['train'][:2])
@@ -57,7 +57,7 @@ def test_preprocess():
 
 
 def test_data_load():
-    from preprocess import graph_collate_fn
+    from data_processing.preprocess import graph_collate_fn
     datasets.enable_progress_bars()
     dataset = datasets.load_dataset("wmt/wmt19", "zh-en", streaming=False)
     train_loader = DataLoader(

@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 import torch
 from jaxtyping import Float
+from networkx.classes import nodes
 from tensordict import TensorDict
 from torch import Tensor, nn
 
@@ -140,40 +141,24 @@ class GraphScorer(nn.Module):
 
     def compute_similarity_scores(self, graphs: dict[str, TensorDict]) -> Float[Tensor, "batch batch"]:
         l1, l2 = graphs.keys()
-        nodes_1 = graphs[l1]['nodes'] # (B1, N1)
-        nodes_2 = graphs[l2]['nodes'] # (B2, N2)
-        batch_size_1 = nodes_1.size(0) # B1 # TODO remove these unnecessary variables that clutter function
-        batch_size_2 = nodes_2.size(0) # B2
         # Normalize so matmul gives cosine similarity
-        H_1 = F.normalize(nodes_1, dim=-1) # (B1, N1, H)
-        H_2 = F.normalize(nodes_2, dim=-1) # (B2, N2, H)
+        nodes_1 = F.normalize(graphs[l1]['nodes'], dim=-1) # (B1, N1, H)
+        nodes_2 = F.normalize(graphs[l2]['nodes'], dim=-1) # (B2, N2, H)
         # Get similarity matrices for each pair across batches
-        S = torch.einsum('bnh,cmh->bcnm', H_1, H_2) # (B1, B2, N1, N2)
         # Flatten into B^2 batches of similarity matrices for each pair in batches
-        S = S.flatten(0, 1) # (B1 * B2, N1, N2)
-        # assert sim.shape == (batch_size_1 * batch_size_2, H_1.size(1), H_2.size(1))
-        # Get mask of invalid pairs due to padding
-        mask_a = graphs[l1]['node_mask']  # (B1, N1)
-        mask_b = graphs[l2]['node_mask']  # (B2, N2)
-        # Repeat masks so they match the flattened similarity matrix
-        mask_a = mask_a.repeat_interleave(batch_size_2, dim=0) # (B1 * B2, N1)
-        mask_b = mask_b.repeat(batch_size_1, 1) # (B1 * B2, N2)
+        S = torch.einsum('bnh,cmh->bcnm', nodes_1, nodes_2).flatten(0, 1) # (B1 * B2, N1, N2)
+        # Get mask of invalid pairs due to padding, and repeat them so they match the flattened similarity matrix
+        mask_1 = graphs[l1]['node_mask'].repeat_interleave(nodes_2.size(0), dim=0) # (B1 * B2, N1)
+        mask_2 = graphs[l2]['node_mask'].repeat(nodes_1.size(0), 1) # (B1 * B2, N2)
         # Divide by lengths to get uniform weights for non-padded entries
-        a_padded = mask_a / mask_a.sum(dim=-1)[:, None] # (B1 * B2, N1)
-        b_padded = mask_b / mask_b.sum(dim=-1)[:, None]  # (B1 * B2, N2)
-        assert a_padded.shape == (batch_size_1 * batch_size_2, mask_a.size(1)), f"{a_padded.shape}"
-        assert b_padded.shape == (batch_size_1 * batch_size_2, mask_b.size(1)), f"{b_padded.shape}"
-
-        # Transform to non-negative cost domain; [-1, 1] -> [0, 2]
-        cost = 1.0 - S
-        # Scale cost matrix to [0, 1] for optimal stability
-        cost = cost / 2.0
+        weights_1 = mask_1 / mask_1.sum(dim=-1)[:, None] # (B1 * B2, N1)
+        weights_2 = mask_2 / mask_2.sum(dim=-1)[:, None]  # (B1 * B2, N2)
+        # Transform to non-negative cost domain; [-1, 1] -> [0, 2] and scale to [0, 1] for optimal stability
+        cost = (1.0 - S) / 2.0
         # Get TODO - I should understand more of the math behind this
-        P = self.sinkhorn(cost, a_padded, b_padded)
+        P = self.sinkhorn(cost, weights_1, weights_2)
         # Use similarity and transport plan matrices to get features
-        # Note: 'a' is rows and 'b' is columns
         weighted_sim = P * S
-        # tqdm.write(str(torch.isfinite(weighted_sim).sum()))
         matched_similarity = weighted_sim.sum(dim=(1, 2))
         matched_mass = P.sum(dim=(1, 2))
         average_similarity = matched_similarity / (matched_mass + 1e-8)
@@ -183,15 +168,15 @@ class GraphScorer(nn.Module):
         # best_similarity_b = (best_similarity_b * mask_b).sum(dim=1) / mask_b.sum(dim=1)
         P_flat = P.flatten(1)
         entropy = -(P_flat * torch.log(P_flat + 1e-8)).sum(dim=1)
-        a_mass = P.sum(dim=2)
-        b_mass = P.sum(dim=1)
-        # a_mass_error = (a_mass - a_padded).abs().sum(dim=1)
-        # b_mass_error = (b_mass - b_padded).abs().sum(dim=1)
-        unmatched_a = ((a_padded - a_mass).clamp(min=0)).sum(dim=1)
-        unmatched_b = ((b_padded - b_mass).clamp(min=0)).sum(dim=1)
-        mean_transport = matched_mass / (mask_a.sum(dim=1) * mask_b.sum(dim=1))
+        mass_1 = P.sum(dim=2)
+        mass_2 = P.sum(dim=1)
+        # a_mass_error = (mass_1 - a_padded).abs().sum(dim=1)
+        # b_mass_error = (mass_2 - b_padded).abs().sum(dim=1)
+        unmatched_a = ((weights_1 - mass_1).clamp(min=0)).sum(dim=1)
+        unmatched_b = ((weights_2 - mass_2).clamp(min=0)).sum(dim=1)
+        mean_transport = matched_mass / (mask_1.sum(dim=1) * mask_2.sum(dim=1))
         max_transport = P.amax(dim=(1, 2))
-        mean_sim = S.sum(dim=(1, 2)) / (mask_a.sum(dim=1) * mask_b.sum(dim=1))
+        mean_sim = S.sum(dim=(1, 2)) / (mask_1.sum(dim=1) * mask_2.sum(dim=1))
 
         features = torch.stack([
             matched_similarity,
@@ -214,5 +199,54 @@ class GraphScorer(nn.Module):
         scores = self.mlp_scorer(features)
         # CHANGE to just trying this
         # scores = matched_similarity
-        scores = scores.unflatten(0, (batch_size_1, batch_size_2))
+        scores = scores.unflatten(0, (nodes_1.size(0), nodes_2.size(0)))
         return scores
+
+    def get_alignments(self, M, relations_row, relations_col): # todo temp
+        row_best = torch.argmax(M, dim=-1)
+        col_best = torch.argmax(M, dim=-2)
+        row_choices = torch.zeros(M.shape)
+        col_choices = torch.zeros(M.shape)
+        row_idx = torch.arange(M.size(-1), device=M.device)
+        row_choices[:, row_idx, row_best] = 1
+        col_idx = torch.arange(M.size(-2), device=M.device)
+        col_choices[:, col_idx, col_best] = 1
+        row_col_agree = row_idx == col_idx.T
+        merged_nodes = row_idx + col_idx.T
+        # todo verify this math
+        num_merged = (merged_nodes.sum(dim=-1) > 1).sum(dim=-1).item()
+        row_to_merged_map = row_best
+        col_to_merged_map = row_best[col_best]
+        # Eliminate reverse edges and self loops that were just used for attention todo
+        relations_row *= relations_row % 2
+        relations_col *= relations_col % 2
+        row_rel_idx = torch.argmax(relations_row, dim=-1)
+        col_rel_idx = torch.argmax(relations_col, dim=-1)
+        row_map = row_to_merged_map[row_rel_idx]
+        col_map = col_to_merged_map[col_rel_idx]
+        merged_idx = torch.arange(num_merged, device=M.device)
+        mapped_row_relations = torch.zeroes(M.size(0), relations_row.size(1), num_merged, device=M.device)
+        mapped_col_relations = torch.zeroes(M.size(0), relations_col.size(1), num_merged, device=M.device)
+        mapped_row_relations[:, torch.arange(relations_row.size(1), device=M.device), row_map] = 1 # todo not 1?
+        mapped_col_relations[:, torch.arange(relations_col.size(1), device=M.device), col_map] = 1
+        merged = torch.zeros(M.size(0), num_merged, num_merged, device=M.device)
+        row_idx_3d = row_map.unsqueeze(-1).expand(-1, -1, mapped_row_relations.size(-1))
+        col_idx_3d = col_map.unsqueeze(-1).expand(-1, -1, mapped_row_relations.size(-1))
+        merged_relations_row = merged.scatter_reduce(dim=1, index=row_idx_3d, src=mapped_row_relations, reduce='sum')
+        merged_relations_col = merged.scatter_reduce(dim=1, index=col_idx_3d, src= mapped_col_relations, reduce='sum')
+        merged_cols = merged.scatter_reduce(dim=1, index=col_)
+        # row_relations_merged[:, merged_idx, row_labels] = 1 # todo fix this
+        # col_relations_merged[:, merged_idx, col_labels] = 1
+        # todo check that there are relations between nodes that are merged? - aka should have a self loop with 1 for each merged node
+        # Check that merged nodes share relations?
+
+
+        row_agree_idx = row_col_agree.sum(dim=-1)
+        # Now we want to check that tokens with 1 to 1 alignments share relations? maybe
+        # distinguish between direction of relation?
+        row_rels = relations_row[:, row_agree_idx]
+        col_agree_idx = row_col_agree.sum(dim=-2)
+        col_rels = relations_col[:, col_agree_idx]
+
+
+

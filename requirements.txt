@@ -3,7 +3,6 @@ datasets
 einops
 jaxtyping
 matplotlib
-model
 numpy
 protobuf
 pydantic

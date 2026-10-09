@@ -8,9 +8,9 @@ from dotenv import load_dotenv
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from generate_data import generate_hard_negatives
-from graph_builder import UPOS_MAP, NER_MAP, REL_MAP
-from loss import get_loss_on_batch
+from data_processing.generate_data import generate_hard_negatives
+from data_processing.graph_builder import UPOS_MAP, NER_MAP, REL_MAP
+from models.loss import get_loss_on_batch
 from model import GraphMatcher, ModelConfig
 
 
@@ -53,7 +53,7 @@ def eval_on_hard_negatives(config: ModelConfig, checkpoint: str | Path, num_batc
         data_dict['translation'].extend([{'zh': pair['zh'], 'en': var} for var in vars])
 
     hard_negs = Dataset.from_dict(data_dict)
-    from preprocess import graph_collate_fn
+    from data_processing.preprocess import graph_collate_fn
     val_loader = DataLoader(hard_negs, batch_size=4, collate_fn=graph_collate_fn, shuffle=False)
 
     checkpoint = torch.load(checkpoint, weights_only=True)
@@ -81,7 +81,7 @@ def eval_on_hard_negatives(config: ModelConfig, checkpoint: str | Path, num_batc
 
 def eval_on_validation_set(config: ModelConfig, checkpoint: str | Path, num_batches: int = None):
     dataset = datasets.load_dataset("wmt/wmt19", "zh-en", split='validation')
-    from preprocess import graph_collate_fn
+    from data_processing.preprocess import graph_collate_fn
     val_loader = DataLoader(dataset, batch_size=16, collate_fn=graph_collate_fn, shuffle=True)
     checkpoint = torch.load(checkpoint, weights_only=True)
 
